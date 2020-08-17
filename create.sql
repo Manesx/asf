@@ -51,6 +51,7 @@ create table if not exists reactions
     id                  serial,
 
     message_id          integer,
+    rated_message_id    integer,
     initiator_id        integer not null,
     rated_id            integer not null,
 
@@ -68,17 +69,22 @@ create function mark_reaction_as_viewed(_user_id integer, _message_id integer) r
 as
 $$
 begin
-    if user_is_exist(_user_id) then
-        update reactions
-        set viewed = TRUE
-        where rated_id = _user_id
-          and message_id = _message_id
-          and initiator_is_author = FALSE;
-        if found then
-            return True;
-        end if;
-    end if;
-    return False;
+    update reactions
+    set viewed = TRUE
+    where ((
+                   message_id = _message_id and
+                   initiator_id = _user_id and
+                   initiator_is_author = TRUE and
+                   is_ads = TRUE
+               )
+        or (
+                   rated_message_id = _message_id and
+                   rated_id = _user_id and
+                   initiator_is_author = FALSE and
+                   is_ads = FALSE
+               ))
+      and viewed = FALSE;
+    return true;
 end;
 $$;
 
@@ -167,17 +173,19 @@ create or replace function next_reaction(_user_id integer, show_interval integer
 as
 $$
 declare
-    _rated_id int;
-    _is_ads   boolean;
+    _rated_id            int;
+    _is_ads              boolean;
     _count_users_for_ads integer;
 begin
     if user_is_exist(_user_id) then
         update users set is_hide = FALSE where user_id = _user_id;
-        select count(t2.id) into _count_users_for_ads
-        from reactions as t2 where t2.initiator_id = _user_id and
-                                                       t2.initiator_is_author = TRUE and
-                                   t2.is_ads = FALSE;
-        if FOUND and _count_users_for_ads > 3 then
+        select count(t2.id)
+        into _count_users_for_ads
+        from reactions as t2
+        where t2.initiator_id = _user_id
+          and t2.initiator_is_author = TRUE
+          and t2.is_ads = FALSE;
+        if FOUND and _count_users_for_ads >= 2 then
             _rated_id = select_ads(_user_id, show_interval);
             _is_ads = True;
             if _rated_id is null then
@@ -243,11 +251,11 @@ begin
           and t2.create_time + t2.duration > c_time;
         if found then
             if ads_viewed then
-                    if t > show_interval then
-                        reaction_rated_id = next_ads(reaction_rated_id);
-                    else
-                        return null;
-                    end if;
+                if t > show_interval then
+                    reaction_rated_id = next_ads(reaction_rated_id);
+                else
+                    return null;
+                end if;
             else
                 return null;
             end if;
@@ -264,18 +272,15 @@ begin
 end;
 $$;
 
-
-
 create or replace function next_user(_user_id integer) returns integer
     language plpgsql
 as
 $$
 declare
-    search_s          integer;
-    user_id_next_user integer;
-    id_next_user      integer;
-    before_age        integer;
-    after_age         integer;
+    search_s     integer;
+    id_next_user integer;
+    before_age   integer;
+    after_age    integer;
 begin
     select t2.search_sex,
            t2.search_before_age,
@@ -286,54 +291,44 @@ begin
         after_age
     from users as t2
     where (t2.user_id = _user_id);
-    if found then
-        select t2.id
-        into
-            id_next_user
-        from users as t2
-        where t2.user_id = (select t2.rated_id
-                            from reactions as t2
-                            where (
-                                          t2.id = (
-                                          select max(t2.id)
-                                          from reactions as t2
-                                          where (
-                                                        (t2.initiator_id = _user_id) and
-                                                        (t2.rated_id > 0) and
-                                                        (t2.is_ads = FALSE)
-                                                    )
-                                      )
-                                      ));
 
-        if id_next_user is null then
-            id_next_user = 0;
-        end if;
+    if FOUND then
         if search_s > 0 then
             select t2.user_id
-            into user_id_next_user
+            into id_next_user
             from users as t2
-            where (
-                          (t2.id > id_next_user) and
-                          (t2.sex = search_s) and
-                          (t2.user_id != _user_id) and
-                          (t2.is_hide is FALSE) and
-                          (t2.age >= before_age) and
-                          (t2.age <= after_age)
-                      );
+            where (t2.user_id not in (
+                select t3.rated_id
+                from reactions as t3
+                where (t3.initiator_id = _user_id and
+                       t3.rated_id > 0 and
+                       t3.is_ads = FALSE)
+            ) and
+                   t2.user_id != _user_id and
+                   t2.sex = search_s and
+                   t2.is_hide is FALSE and
+                   t2.age >= before_age and
+                   t2.age <= after_age)
+            limit 1;
         else
             select t2.user_id
-            into user_id_next_user
+            into id_next_user
             from users as t2
-            where (
-                          (t2.id > id_next_user) and
-                          (t2.user_id != _user_id) and
-                          (t2.is_hide is FALSE) and
-                          (t2.age >= before_age) and
-                          (t2.age <= after_age)
-                      );
+            where (t2.user_id not in (
+                select t3.rated_id
+                from reactions as t3
+                where (t3.initiator_id = _user_id and
+                       t3.rated_id > 0 and
+                       t3.is_ads = FALSE)
+            ) and
+                   t2.user_id != _user_id and
+                   t2.is_hide is FALSE and
+                   t2.age >= before_age and
+                   t2.age <= after_age)
+            limit 1;
         end if;
     end if;
-    return user_id_next_user;
+    return id_next_user;
 end;
 $$;
 
@@ -343,7 +338,7 @@ as
 $$
 declare
     ret_ads_id integer;
-    c_time integer;
+    c_time     integer;
 begin
     if ads_id is null then
         ads_id = 0;
@@ -448,7 +443,7 @@ begin
 end;
 $$;
 
-create or replace function get_user_id_next_reaction(_user_id integer) returns integer
+create or replace function get_id_next_reaction(_user_id integer) returns integer
     language plpgsql
 as
 $$
@@ -456,14 +451,53 @@ declare
     initiator_id int;
 begin
     if user_is_exist(_user_id) then
-        select t2.initiator_id
+        select t2.id
         into initiator_id
         from reactions as t2
         where (
-                      t2.rated_id = _user_id and t2.liked = TRUE and t2.viewed = FALSE and t2.time > 0
+                      t2.rated_id = _user_id and
+                      t2.liked = TRUE and
+                      t2.rated_message_id is null
                   );
     end if;
     return initiator_id;
+end;
+$$;
+
+create or replace function last_created_reaction_for_like(_user_id integer) returns integer
+    language plpgsql
+as
+$$
+declare
+    last_reaction integer;
+begin
+    if user_is_exist(_user_id) then
+        select max(t2.id)
+        into last_reaction
+        from reactions as t2
+        where t2.is_ads = FALSE
+          and t2.rated_message_id is null
+          and t2.initiator_is_author = TRUE
+          and t2.liked = FALSE
+          and t2.viewed = FALSE
+          and t2.initiator_id = _user_id;
+        if found then
+            update reactions set liked = TRUE where id = last_reaction;
+            perform t2.id
+            from reactions as t2
+            where t2.initiator_id = (
+                select t3.rated_id
+                from reactions as t3
+                where t3.id = last_reaction
+            )
+              and t2.rated_id = _user_id
+              and t2.liked = TRUE;
+            if found then
+                return last_reaction;
+            end if;
+        end if;
+    end if;
+    return null;
 end;
 $$;
 
@@ -477,6 +511,19 @@ begin
         return TRUE;
     end if;
     return FALSE;
+end;
+$$;
+
+create or replace function reset_ads(ads_id integer) returns boolean
+    language plpgsql
+as
+$$
+    declare
+        t_time integer;
+begin
+        t_time = extract(epoch from now());
+    update ads set create_time = t_time where (id = ads_id);
+    return true;
 end;
 $$;
 
@@ -574,12 +621,15 @@ begin
         into count_reactions
         from reactions as t2
         where (
-                      t2.rated_id = _user_id and t2.liked = TRUE and t2.viewed = FALSE and t2.time > 0);
+                      t2.rated_id = _user_id and
+                      t2.liked = TRUE and
+                      t2.viewed = FALSE
+                  );
+        if found then
+            return count_reactions;
+        end if;
     end if;
-    if count_reactions is null then
-        count_reactions = 0;
-    end if;
-    return count_reactions;
+    return 0;
 end
 $$;
 
