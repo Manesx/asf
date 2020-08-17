@@ -58,7 +58,8 @@ create table if not exists reactions
     is_ads              boolean not null,
     initiator_is_author boolean not null,
 
-    liked               boolean not null,
+    liked               boolean,
+    disliked            boolean,
     viewed              boolean not null,
 
     time                integer
@@ -87,6 +88,7 @@ begin
     return true;
 end;
 $$;
+
 
 create or replace function create_ads(_user_id integer, _message_id integer, _text text, _link text, _media text,
                                       _token text,
@@ -410,6 +412,33 @@ begin
 end;
 $$;
 
+create or replace function last_created_reaction_for_dislike(_user_id integer) returns boolean
+    language plpgsql
+as
+$$
+declare
+    last_reaction integer;
+begin
+    if user_is_exist(_user_id) then
+        select max(t2.id)
+        into last_reaction
+        from reactions as t2
+        where t2.is_ads = FALSE
+          and t2.rated_message_id is null
+          and t2.initiator_is_author = TRUE
+          and t2.liked is null
+          and t2.disliked is null
+          and t2.viewed = FALSE
+          and t2.initiator_id = _user_id;
+        if found then
+            update reactions set disliked = TRUE where id = last_reaction;
+            return TRUE;
+        end if;
+    end if;
+    return FALSE;
+end;
+$$;
+
 create or replace function change_image(_user_id integer, image_url text) returns boolean
     language plpgsql
 as
@@ -435,8 +464,8 @@ declare
 begin
     if user_is_exist(initiator_user_id) then
         t_time = extract(epoch from now());
-        insert into reactions(initiator_id, rated_id, liked, initiator_is_author, is_ads, viewed, time)
-        values (initiator_user_id, rated_user_id, FALSE, TRUE, reaction_is_ads, FALSE, t_time)
+        insert into reactions(initiator_id, rated_id, initiator_is_author, is_ads, viewed, time)
+        values (initiator_user_id, rated_user_id, TRUE, reaction_is_ads, FALSE, t_time)
         returning id into ret;
     end if;
     return ret;
@@ -457,6 +486,7 @@ begin
         where (
                       t2.rated_id = _user_id and
                       t2.liked = TRUE and
+                      t2.disliked is null and
                       t2.rated_message_id is null
                   );
     end if;
@@ -478,7 +508,8 @@ begin
         where t2.is_ads = FALSE
           and t2.rated_message_id is null
           and t2.initiator_is_author = TRUE
-          and t2.liked = FALSE
+          and t2.liked is null
+          and t2.disliked is null
           and t2.viewed = FALSE
           and t2.initiator_id = _user_id;
         if found then
