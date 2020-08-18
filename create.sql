@@ -65,6 +65,18 @@ create table if not exists reactions
     time                integer
 );
 
+create or replace function last_reaction_id(_user_id integer) returns integer
+    language plpgsql
+as
+$$
+declare
+    reaction_id integer;
+begin
+    select max(t2.id) into reaction_id from reactions as t2 where t2.initiator_id = _user_id;
+    return reaction_id;
+end;
+$$;
+
 create function mark_reaction_as_viewed(_user_id integer, _message_id integer) returns boolean
     language plpgsql
 as
@@ -72,18 +84,18 @@ $$
 begin
     update reactions
     set viewed = TRUE
-    where ((
-                   message_id = _message_id and
-                   initiator_id = _user_id and
-                   initiator_is_author = TRUE and
-                   is_ads = TRUE
-               )
-        or (
-                   rated_message_id = _message_id and
-                   rated_id = _user_id and
-                   initiator_is_author = FALSE and
-                   is_ads = FALSE
-               ))
+    where (
+                initiator_is_author = TRUE and
+                (
+                        message_id = _message_id and
+                        initiator_id = _user_id and
+                        is_ads = TRUE
+                    )
+            or (
+                        rated_message_id = _message_id and
+                        rated_id = _user_id and
+                        is_ads = FALSE
+                    ))
       and viewed = FALSE;
     return true;
 end;
@@ -199,7 +211,7 @@ begin
             _is_ads = False;
         end if;
         if _rated_id is not null then
-            return create_reaction(_user_id, _rated_id, _is_ads);
+            return create_reaction(_user_id, _rated_id, TRUE, _is_ads);
         end if;
     end if;
     return null;
@@ -454,7 +466,7 @@ end;
 $$;
 
 create or replace function create_reaction(initiator_user_id integer, rated_user_id integer,
-                                           reaction_is_ads boolean) returns integer
+                                           _initiator_is_author boolean, reaction_is_ads boolean) returns integer
     language plpgsql
 as
 $$
@@ -465,7 +477,7 @@ begin
     if user_is_exist(initiator_user_id) then
         t_time = extract(epoch from now());
         insert into reactions(initiator_id, rated_id, initiator_is_author, is_ads, viewed, time)
-        values (initiator_user_id, rated_user_id, TRUE, reaction_is_ads, FALSE, t_time)
+        values (initiator_user_id, rated_user_id, _initiator_is_author, reaction_is_ads, FALSE, t_time)
         returning id into ret;
     end if;
     return ret;
@@ -478,19 +490,25 @@ as
 $$
 declare
     initiator_id int;
+    _id          integer;
 begin
     if user_is_exist(_user_id) then
-        select t2.id
-        into initiator_id
+        select t2.id,
+               t2.initiator_id
+        into _id,
+            initiator_id
         from reactions as t2
         where (
                       t2.rated_id = _user_id and
                       t2.liked = TRUE and
-                      t2.disliked is null and
-                      t2.rated_message_id is null
-                  );
+                      t2.viewed is FALSE
+                  )
+        limit 1;
+        if FOUND then
+            perform create_reaction(_user_id, initiator_id, FALSE, FALSE);
+        end if;
     end if;
-    return initiator_id;
+    return _id;
 end;
 $$;
 
@@ -500,27 +518,24 @@ as
 $$
 declare
     last_reaction integer;
+    _rated_id integer;
 begin
     if user_is_exist(_user_id) then
         select max(t2.id)
         into last_reaction
         from reactions as t2
         where t2.is_ads = FALSE
-          and t2.rated_message_id is null
-          and t2.initiator_is_author = TRUE
           and t2.liked is null
           and t2.disliked is null
-          and t2.viewed = FALSE
           and t2.initiator_id = _user_id;
         if found then
+            select t3.rated_id into _rated_id
+                from reactions as t3
+                where t3.id = last_reaction;
             update reactions set liked = TRUE where id = last_reaction;
             perform t2.id
             from reactions as t2
-            where t2.initiator_id = (
-                select t3.rated_id
-                from reactions as t3
-                where t3.id = last_reaction
-            )
+            where t2.initiator_id = _rated_id
               and t2.rated_id = _user_id
               and t2.liked = TRUE;
             if found then
@@ -549,10 +564,10 @@ create or replace function reset_ads(ads_id integer) returns boolean
     language plpgsql
 as
 $$
-    declare
-        t_time integer;
+declare
+    t_time integer;
 begin
-        t_time = extract(epoch from now());
+    t_time = extract(epoch from now());
     update ads set create_time = t_time where (id = ads_id);
     return true;
 end;
