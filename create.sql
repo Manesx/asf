@@ -14,7 +14,8 @@ create table if not exists users
     city              text,
     about             text,
     media             text,
-    coordinates       text,
+    locationLatitude  real,
+    locationLongitude real,
     sex               integer not null,
     search_sex        integer not null,
     search_before_age integer not null,
@@ -64,6 +65,28 @@ create table if not exists reactions
 
     time                integer
 );
+
+create or replace function haversine(latitude1 real, longitude1 real, latitude2 real, longitude2 real) returns real
+    language plpgsql
+as
+$$
+declare
+    earth_r constant integer = 6371302;
+    phi1             real;
+    phi2             real;
+    dphi             real;
+    dlambda          real;
+    a                real;
+begin
+    phi1 = radians(latitude1);
+    phi2 = radians(latitude2);
+    dphi = radians(latitude2 - latitude1);
+    dlambda = radians(longitude2 - longitude1);
+    a = pow(sin(dphi / 2), 2) +
+        cos(phi1) * cos(phi2) * pow(sin(dlambda / 2), 2);
+    return 2 * earth_r * atan2(sqrt(a), sqrt(1 - a));
+end;
+$$;
 
 create or replace function last_reaction_id(_user_id integer) returns integer
     language plpgsql
@@ -163,7 +186,9 @@ $$;
 create or replace function create_user(_user_id integer,
                                        user_name text,
                                        user_sex integer,
-                                       _city text) returns boolean
+                                       _city text,
+                                       _locationLatitude real,
+                                       _locationLongitude real) returns boolean
     language plpgsql
 as
 $$
@@ -171,9 +196,10 @@ begin
     if not user_is_exist(_user_id) then
         insert into messages(user_id, message_id, reaction_id) values (_user_id, 0, 0);
         insert into wait_actions(user_id, action) values (_user_id, '');
-        insert into users(user_id, first_name, city, sex, search_sex, search_before_age, search_after_age,
+        insert into users(user_id, first_name, city, sex, locationLatitude, locationLongitude,
+                          search_sex, search_before_age, search_after_age,
                           is_hide)
-        values (_user_id, user_name, _city, user_sex, 0, 0, 100, true);
+        values (_user_id, user_name, _city, user_sex, _locationLatitude, _locationLongitude, 0, 0, 100, true);
         return True;
     end if;
     return False;
@@ -295,21 +321,36 @@ declare
     id_next_user integer;
     before_age   integer;
     after_age    integer;
+    user_age     integer;
+    latitude     real;
+    longitude    real;
+    distance     real;
 begin
     select t2.search_sex,
            t2.search_before_age,
-           t2.search_after_age
+           t2.search_after_age,
+           t2.age,
+           t2.locationLatitude,
+           t2.locationLongitude
     into
         search_s,
         before_age,
-        after_age
+        after_age,
+        user_age,
+        latitude,
+        longitude
     from users as t2
     where (t2.user_id = _user_id);
 
     if FOUND then
         if search_s > 0 then
-            select t2.user_id
-            into id_next_user
+            select t2.user_id,
+                   haversine(t2.locationLatitude,
+                             t2.locationLongitude,
+                             latitude,
+                             longitude) as _distance
+            into id_next_user,
+                distance
             from users as t2
             where (t2.user_id not in (
                 select t3.rated_id
@@ -321,12 +362,20 @@ begin
                    t2.user_id != _user_id and
                    t2.sex = search_s and
                    t2.is_hide is FALSE and
-                   t2.age >= before_age and
-                   t2.age <= after_age)
+                   ((t2.age >= before_age and
+                     t2.age <= after_age) or
+                    (t2.search_before_age <= user_age and
+                     t2.search_after_age >= user_age)))
+            order by _distance
             limit 1;
         else
-            select t2.user_id
-            into id_next_user
+            select t2.user_id,
+                   haversine(t2.locationLatitude,
+                             t2.locationLongitude,
+                             latitude,
+                             longitude) as _distance
+            into id_next_user,
+                distance
             from users as t2
             where (t2.user_id not in (
                 select t3.rated_id
@@ -339,12 +388,14 @@ begin
                    t2.is_hide is FALSE and
                    t2.age >= before_age and
                    t2.age <= after_age)
+            order by _distance
             limit 1;
         end if;
     end if;
     return id_next_user;
 end;
 $$;
+
 
 create or replace function next_ads(ads_id integer) returns integer
     language plpgsql
@@ -518,7 +569,7 @@ as
 $$
 declare
     last_reaction integer;
-    _rated_id integer;
+    _rated_id     integer;
 begin
     if user_is_exist(_user_id) then
         select max(t2.id)
@@ -529,9 +580,10 @@ begin
           and t2.disliked is null
           and t2.initiator_id = _user_id;
         if found then
-            select t3.rated_id into _rated_id
-                from reactions as t3
-                where t3.id = last_reaction;
+            select t3.rated_id
+            into _rated_id
+            from reactions as t3
+            where t3.id = last_reaction;
             update reactions set liked = TRUE where id = last_reaction;
             perform t2.id
             from reactions as t2
@@ -601,12 +653,12 @@ begin
 end;
 $$;
 
-create or replace function change_location(_user_id integer, user_coordinates text) returns boolean
+create or replace function change_location(_user_id integer, latitude real, longitude real) returns boolean
     language plpgsql
 as
 $$
 begin
-    update users set coordinates = user_coordinates where (user_id = _user_id);
+    update users set locationLatitude = latitude, locationLongitude = longitude where (user_id = _user_id);
     if FOUND then
         perform change_action(_user_id, '');
         return true;
