@@ -1,26 +1,23 @@
-create table if not exists wait_actions
-(
-    user_id integer not null,
-    action  text    not null
-);
+drop table if exists ads, messages, reactions, users, wait_actions cascade;
+drop view if exists empty_reactions, liked_reactions, profile_reactions, reactions_ads;
 
 create table if not exists users
 (
     id                serial,
 
-    user_id           integer not null,
+    user_id           integer primary key,
     first_name        text    not null,
-    age               integer,
-    city              text,
+    age               integer default 0,
+    city              text    not null,
     about             text,
     media             text,
-    locationLatitude  real,
-    locationLongitude real,
+    locationLatitude  real    not null,
+    locationLongitude real    not null,
     sex               integer not null,
-    search_sex        integer not null,
-    search_before_age integer not null,
-    search_after_age  integer not null,
-    is_hide           boolean not null
+    search_sex        integer default 0,
+    search_before_age integer default 1,
+    search_after_age  integer default 100,
+    is_hide           boolean default TRUE
 );
 
 create table if not exists ads
@@ -28,42 +25,96 @@ create table if not exists ads
     id          serial,
 
     message_id  integer not null,
-    group_id    integer not null,
-    token       text    not null,
-    is_hide     boolean not null,
+    is_hide     boolean default TRUE,
 
-    text        text,
-    media       text,
-    link        text,
+    description text    not null,
+    media       text    not null,
+    link        text    not null,
 
     duration    integer not null,
-    create_time integer not null
-);
-
-create table if not exists messages
-(
-    user_id     integer not null,
-    message_id  integer not null,
-    reaction_id integer not null
+    create_time integer default extract(epoch from now())
 );
 
 create table if not exists reactions
 (
-    id                  serial,
+    id           serial,
 
-    message_id          integer,
-    rated_message_id    integer,
-    initiator_id        integer not null,
-    rated_id            integer not null,
+    message_id   integer,
+    initiator_id integer not null,
+    rated_id     integer not null,
 
-    is_ads              boolean not null,
-    initiator_is_author boolean not null,
+    is_ads       boolean not null,
 
-    liked               boolean,
-    disliked            boolean,
-    viewed              boolean not null,
+    liked        boolean default FALSE,
+    disliked     boolean default FALSE,
+    viewed       boolean default FALSE,
 
-    time                integer
+    time         integer default extract(epoch from now()),
+    foreign key (initiator_id) references users (user_id) on delete cascade,
+    foreign key (rated_id) references users (user_id) on delete cascade
+);
+
+create table if not exists wait_actions
+(
+    user_id integer,
+    action  text,
+    foreign key (user_id) references users (user_id) on delete cascade
+);
+
+create view reactions_ads as
+select t2.id,
+       t2.initiator_id as author_id,
+       t2.rated_id     as ads_id,
+       t2.viewed,
+       t2.time
+from reactions as t2
+where t2.is_ads = TRUE;
+
+create view profile_reactions as
+select t2.id,
+       t2.message_id,
+       t2.initiator_id,
+       t2.rated_id,
+       t2.liked,
+       t2.disliked,
+       t2.viewed,
+       t2.time
+from reactions as t2
+where t2.is_ads = FALSE;
+
+create view empty_reactions as
+select t2.id,
+       t2.message_id,
+       t2.initiator_id,
+       t2.rated_id,
+       t2.viewed,
+       t2.time
+from profile_reactions as t2
+where t2.liked is FALSE
+  and t2.disliked is FALSE;
+
+create view liked_reactions as
+select t2.id,
+       t2.initiator_id,
+       t2.rated_id,
+       t2.viewed,
+       t2.time
+from profile_reactions as t2
+where t2.liked is TRUE
+  and t2.disliked is FALSE
+  and not exists(select t3.id
+                 from profile_reactions as t3
+                 where t3.rated_id = t2.initiator_id
+                   and t3.initiator_id = t2.rated_id);
+
+
+
+create table if not exists messages
+(
+    user_id     integer not null,
+    message_id  integer,
+    reaction_id integer,
+    foreign key (user_id) references users (user_id) on delete cascade
 );
 
 create or replace function haversine(latitude1 real, longitude1 real, latitude2 real, longitude2 real) returns real
@@ -72,134 +123,103 @@ as
 $$
 declare
     earth_r constant integer = 6371302;
-    phi1             real;
-    phi2             real;
-    dphi             real;
-    dlambda          real;
     a                real;
 begin
-    phi1 = radians(latitude1);
-    phi2 = radians(latitude2);
-    dphi = radians(latitude2 - latitude1);
-    dlambda = radians(longitude2 - longitude1);
-    a = pow(sin(dphi / 2), 2) +
-        cos(phi1) * cos(phi2) * pow(sin(dlambda / 2), 2);
+    a = pow(sin(radians(latitude2 - latitude1) / 2), 2) +
+        cos(radians(latitude1)) * cos(radians(latitude2)) * pow(sin(radians(longitude2 - longitude1) / 2), 2);
     return 2 * earth_r * atan2(sqrt(a), sqrt(1 - a));
 end;
 $$;
 
-create or replace function last_reaction_id(_user_id integer) returns integer
-    language plpgsql
-as
-$$
-declare
-    reaction_id integer;
-begin
-    select max(t2.id) into reaction_id from reactions as t2 where t2.initiator_id = _user_id;
-    return reaction_id;
-end;
-$$;
-
-create function mark_reaction_as_viewed(_user_id integer, _message_id integer) returns boolean
+create function viewed_reaction(_user_id integer, _message_id integer) returns boolean
     language plpgsql
 as
 $$
 begin
-    update reactions
+    update reactions as t2
     set viewed = TRUE
-    where (
-                initiator_is_author = TRUE and
-                (
-                        message_id = _message_id and
-                        initiator_id = _user_id and
-                        is_ads = TRUE
-                    )
-            or (
-                        rated_message_id = _message_id and
-                        rated_id = _user_id and
-                        is_ads = FALSE
-                    ))
-      and viewed = FALSE;
-    return true;
+    where t2.message_id = _message_id
+      and t2.initiator_id = _user_id
+      and t2.viewed = FALSE;
+    return FOUND;
 end;
 $$;
 
-
-create or replace function create_ads(_user_id integer, _message_id integer, _text text, _link text, _media text,
-                                      _token text,
-                                      _group_id integer, _duration integer) returns boolean
+create or replace function create_ads(_user_id integer,
+                                      _message_id integer,
+                                      _text text,
+                                      _link text,
+                                      _media text,
+                                      _duration integer) returns boolean
     language plpgsql
 as
 $$
-declare
-    c_time integer;
 begin
     if user_is_exist(_user_id) then
-        c_time = extract(epoch from now());
-        insert into ads(group_id, message_id, token, is_hide, text, media, link, duration, create_time)
-        values (_group_id, _message_id, _token, TRUE, _text, _media, _link, _duration, c_time);
-        perform change_action(_user_id, '');
+        insert into ads(message_id,
+                        description,
+                        media,
+                        link,
+                        duration)
+        values (_message_id,
+                _text,
+                _media,
+                _link,
+                _duration);
+        perform clear_action(_user_id);
         return True;
     end if;
     return False;
 end;
 $$;
 
-create or replace function activate_ads(_user_id integer) returns boolean
+create or replace function activate_ads(ads_id integer) returns boolean
     language plpgsql
 as
 $$
 begin
-    if user_is_exist(_user_id) then
-        update reactions
-        set viewed = TRUE,
-            liked  = TRUE
-        where rated_id = _user_id
-          and liked = FALSE;
-        if found then
-            return True;
-        end if;
-    end if;
-    return False;
+    update ads as t2
+    set is_hide = FALSE
+    where t2.id = ads_id;
+    return FOUND;
 end;
 $$;
 
-create or replace function respond_to_reaction(_user_id integer) returns boolean
+create or replace function deactivate_ads(ads_id integer) returns boolean
     language plpgsql
 as
 $$
 begin
-    if user_is_exist(_user_id) then
-        update reactions
-        set viewed = TRUE,
-            liked  = TRUE
-        where rated_id = _user_id
-          and liked = FALSE;
-        if found then
-            return True;
-        end if;
-    end if;
-    return False;
+    update ads as t2
+    set is_hide = TRUE
+    where t2.id = ads_id;
+    return FOUND;
 end;
 $$;
 
-create or replace function create_user(_user_id integer,
-                                       user_name text,
-                                       user_sex integer,
-                                       _city text,
-                                       _locationLatitude real,
-                                       _locationLongitude real) returns boolean
+create function create_user(_user_id integer, user_name text, user_sex integer, _city text, _locationlatitude real,
+                            _locationlongitude real) returns boolean
     language plpgsql
 as
 $$
 begin
     if not user_is_exist(_user_id) then
-        insert into messages(user_id, message_id, reaction_id) values (_user_id, 0, 0);
-        insert into wait_actions(user_id, action) values (_user_id, '');
-        insert into users(user_id, first_name, city, sex, locationLatitude, locationLongitude,
-                          search_sex, search_before_age, search_after_age,
-                          is_hide)
-        values (_user_id, user_name, _city, user_sex, _locationLatitude, _locationLongitude, 0, 0, 100, true);
+        insert into users(user_id,
+                          first_name,
+                          city,
+                          sex,
+                          locationLatitude,
+                          locationLongitude)
+        values (_user_id,
+                user_name,
+                _city,
+                user_sex,
+                _locationLatitude,
+                _locationLongitude);
+        insert into messages(user_id)
+        values (_user_id);
+        insert into wait_actions(user_id)
+        values (_user_id);
         return True;
     end if;
     return False;
@@ -208,39 +228,111 @@ $$;
 
 
 
-create or replace function next_reaction(_user_id integer, show_interval integer) returns integer
+create or replace function next_reaction(_user_id integer, show_interval integer)
+    returns
+        table
+        (
+            _is_ads      boolean,
+            _reaction_id integer,
+            ads_id       integer,
+            description  text,
+            link         text,
+            user_id      integer,
+            first_name   text,
+            age          integer,
+            city         text,
+            sex          integer,
+            about        text,
+            media        text,
+            distance     real
+        )
     language plpgsql
 as
 $$
 declare
-    _rated_id            int;
-    _is_ads              boolean;
+    _rated_id            integer;
+    _reaction_id         integer;
+    _is_ads              boolean = FALSE;
     _count_users_for_ads integer;
+    u_latitude           real;
+    u_longitude          real;
 begin
-    if user_is_exist(_user_id) then
-        update users set is_hide = FALSE where user_id = _user_id;
+    if is_fulled(_user_id) then
+        update users as t2
+        set is_hide = FALSE
+        where t2.user_id = _user_id
+        returning t2.locationlatitude, t2.locationlongitude into u_latitude, u_longitude;
         select count(t2.id)
         into _count_users_for_ads
-        from reactions as t2
-        where t2.initiator_id = _user_id
-          and t2.initiator_is_author = TRUE
-          and t2.is_ads = FALSE;
+        from profile_reactions as t2
+        where t2.initiator_id = _user_id;
         if FOUND and _count_users_for_ads >= 2 then
             _rated_id = select_ads(_user_id, show_interval);
-            _is_ads = True;
-            if _rated_id is null then
-                _rated_id = next_user(_user_id);
-                _is_ads = False;
+            if _rated_id is not null then
+               _is_ads = TRUE;
             end if;
-        else
+        end if;
+        if _rated_id is null then
+            select t3.id,
+                   t3.rated_id
+            into _reaction_id,
+                _rated_id
+            from empty_reactions as t3
+            where t3.initiator_id = _user_id
+            limit 1;
+            if found then
+                update reactions as t2
+                set message_id = null::integer,
+                    time       = extract(epoch from now())::integer,
+                    viewed     = FALSE
+                where t2.id = _reaction_id;
+            end if;
+        end if;
+        if _rated_id is null then
             _rated_id = next_user(_user_id);
-            _is_ads = False;
         end if;
         if _rated_id is not null then
-            return create_reaction(_user_id, _rated_id, TRUE, _is_ads);
+            if _reaction_id is null then
+                _reaction_id = create_reaction(_user_id, _rated_id, _is_ads);
+            end if;
+            if _is_ads then
+                return query select _is_ads,
+                                    _reaction_id,
+                                    t3.id         as ads_id,
+                                    t3.description,
+                                    t3.link,
+                                    null::integer as user_id,
+                                    null          as first_name,
+                                    null::integer as age,
+                                    null          as city,
+                                    null::integer as sex,
+                                    null          as about,
+                                    t3.media,
+                                    null::real    as distance
+                             from ads as t3
+                             where t3.id = _rated_id;
+            else
+                return query select _is_ads,
+                                    _reaction_id,
+                                    null::integer                   as ads_id,
+                                    null                            as description,
+                                    null                            as link,
+                                    t3.user_id,
+                                    t3.first_name,
+                                    t3.age,
+                                    t3.city,
+                                    t3.sex,
+                                    t3.about,
+                                    t3.media,
+                                    haversine(u_latitude,
+                                              u_longitude,
+                                              t3.locationLatitude,
+                                              t3.locationLongitude) as distance
+                             from users as t3
+                             where t3.user_id = _rated_id;
+            end if;
         end if;
     end if;
-    return null;
 end;
 $$;
 
@@ -249,31 +341,30 @@ create or replace function select_ads(_user_id integer, show_interval integer) r
 as
 $$
 declare
-    c_time            integer;
-    ads_id            integer;
-    reaction_rated_id integer;
-    reaction_time     integer;
-    ads_viewed        boolean;
-    ads_duration      integer;
-    t                 integer;
-    ads_created_time  integer;
+    c_time           integer;
+    _ads_id          integer;
+    _author_id       integer;
+    reaction_time    integer;
+    ads_viewed       boolean;
+    ads_duration     integer;
+    t                integer;
+    ads_created_time integer;
 begin
     c_time = extract(epoch from now());
     select t2.id,
-           t2.rated_id,
+           t2.author_id,
            t2.time,
            t2.viewed
     into
-        ads_id,
-        reaction_rated_id,
+        _ads_id,
+        _author_id,
         reaction_time,
         ads_viewed
-    from reactions as t2
+    from reactions_ads as t2
     where t2.id = (
         select max(t1.id)
-        from reactions as t1
-        where t1.initiator_id = _user_id
-          and t1.is_ads = TRUE
+        from reactions_ads as t1
+        where t1.author_id = _user_id
     );
     if reaction_time is null then
         t = 0;
@@ -281,18 +372,18 @@ begin
         t = c_time - reaction_time;
     end if;
     if not found then
-        reaction_rated_id = next_ads(0);
+        _author_id = next_ads(0);
     else
         select t2.duration, t2.create_time
         into ads_duration, ads_created_time
         from ads as t2
-        where t2.id = reaction_rated_id
+        where t2.id = _author_id
           and t2.is_hide = FALSE
           and t2.create_time + t2.duration > c_time;
         if found then
             if ads_viewed then
                 if t > show_interval then
-                    reaction_rated_id = next_ads(reaction_rated_id);
+                    _author_id = next_ads(_author_id);
                 else
                     return null;
                 end if;
@@ -300,15 +391,15 @@ begin
                 return null;
             end if;
         else
-            update ads set is_hide = TRUE where id = reaction_rated_id;
+            update ads as t2 set is_hide = TRUE where t2.id = _author_id;
             if t > show_interval then
-                reaction_rated_id = next_ads(reaction_rated_id);
+                _author_id = next_ads(_author_id);
             else
                 return null;
             end if;
         end if;
     end if;
-    return reaction_rated_id;
+    return _author_id;
 end;
 $$;
 
@@ -340,56 +431,60 @@ begin
         latitude,
         longitude
     from users as t2
-    where (t2.user_id = _user_id);
-
+    where t2.user_id = _user_id;
     if FOUND then
-        if search_s > 0 then
-            select t2.user_id,
-                   haversine(t2.locationLatitude,
-                             t2.locationLongitude,
-                             latitude,
-                             longitude) as _distance
-            into id_next_user,
-                distance
-            from users as t2
-            where (t2.user_id not in (
-                select t3.rated_id
-                from reactions as t3
-                where (t3.initiator_id = _user_id and
-                       t3.rated_id > 0 and
-                       t3.is_ads = FALSE)
-            ) and
-                   t2.user_id != _user_id and
-                   t2.sex = search_s and
-                   t2.is_hide is FALSE and
-                   ((t2.age >= before_age and
-                     t2.age <= after_age) or
-                    (t2.search_before_age <= user_age and
-                     t2.search_after_age >= user_age)))
-            order by _distance
-            limit 1;
-        else
-            select t2.user_id,
-                   haversine(t2.locationLatitude,
-                             t2.locationLongitude,
-                             latitude,
-                             longitude) as _distance
-            into id_next_user,
-                distance
-            from users as t2
-            where (t2.user_id not in (
-                select t3.rated_id
-                from reactions as t3
-                where (t3.initiator_id = _user_id and
-                       t3.rated_id > 0 and
-                       t3.is_ads = FALSE)
-            ) and
-                   t2.user_id != _user_id and
-                   t2.is_hide is FALSE and
-                   t2.age >= before_age and
-                   t2.age <= after_age)
-            order by _distance
-            limit 1;
+        select t3.initiator_id
+        into id_next_user
+        from liked_reactions as t3
+        where t3.rated_id = _user_id
+        limit 1;
+        if not FOUND then
+            if search_s > 0 then
+                select t2.user_id,
+                       haversine(t2.locationLatitude,
+                                 t2.locationLongitude,
+                                 latitude,
+                                 longitude) as _distance
+                into id_next_user,
+                    distance
+                from users as t2
+                where (t2.user_id not in (
+                    select t3.rated_id
+                    from profile_reactions as t3
+                    where t3.initiator_id = _user_id
+                ) and
+                       t2.user_id != _user_id and
+                       t2.sex = search_s and
+                       t2.is_hide is FALSE and
+                       ((t2.age >= before_age and
+                         t2.age <= after_age) or
+                        (t2.search_before_age <= user_age and
+                         t2.search_after_age >= user_age)))
+                order by _distance
+                limit 1;
+            else
+                select t2.user_id,
+                       haversine(t2.locationLatitude,
+                                 t2.locationLongitude,
+                                 latitude,
+                                 longitude) as _distance
+                into id_next_user,
+                    distance
+                from users as t2
+                where (t2.user_id not in (
+                    select t3.rated_id
+                    from profile_reactions as t3
+                    where t3.initiator_id = _user_id
+                ) and
+                       t2.user_id != _user_id and
+                       t2.is_hide is FALSE and
+                       ((t2.age >= before_age and
+                         t2.age <= after_age) or
+                        (t2.search_before_age <= user_age and
+                         t2.search_after_age >= user_age)))
+                order by _distance
+                limit 1;
+            end if;
         end if;
     end if;
     return id_next_user;
@@ -427,78 +522,27 @@ begin
 end;
 $$;
 
-create or replace function remove_user(_user_id integer) returns boolean
+create function user_is_exist(_user_id integer) returns boolean
     language plpgsql
 as
 $$
 begin
-    delete from users where (user_id = _user_id);
-    if found then
-        delete from wait_actions where (user_id = _user_id);
-        delete from messages where (user_id = _user_id);
-        delete
-        from reactions
-        where (initiator_id = _user_id or
-               rated_id = _user_id);
-        return True;
-    end if;
-    return False;
+    return exists(select t2.id from users as t2 where t2.user_id = _user_id);
 end;
 $$;
 
-create or replace function user_is_exist(_user_id integer) returns boolean
+create or replace function dislike_profile(_user_id integer) returns boolean
     language plpgsql
 as
 $$
 begin
-    return (select t2.id from users as t2 where (t2.user_id = _user_id)) is not null;
-end;
-$$;
-
-create or replace function activate_profile(_user_id integer) returns boolean
-    language plpgsql
-as
-$$
-begin
-    update users set is_hide = FALSE where (user_id = _user_id);
-    return found;
-end;
-$$;
-
-create or replace function deactivate_profile(_user_id integer) returns boolean
-    language plpgsql
-as
-$$
-begin
-    update users set is_hide = TRUE where (user_id = _user_id);
+    update reactions as t2
+    set disliked = TRUE
+    where t2.id = (select max(t2.id)
+                   from empty_reactions as t2
+                   where initiator_id = _user_id
+                     and message_id is not null);
     return FOUND;
-end;
-$$;
-
-create or replace function last_created_reaction_for_dislike(_user_id integer) returns boolean
-    language plpgsql
-as
-$$
-declare
-    last_reaction integer;
-begin
-    if user_is_exist(_user_id) then
-        select max(t2.id)
-        into last_reaction
-        from reactions as t2
-        where t2.is_ads = FALSE
-          and t2.rated_message_id is null
-          and t2.initiator_is_author = TRUE
-          and t2.liked is null
-          and t2.disliked is null
-          and t2.viewed = FALSE
-          and t2.initiator_id = _user_id;
-        if found then
-            update reactions set disliked = TRUE where id = last_reaction;
-            return TRUE;
-        end if;
-    end if;
-    return FALSE;
 end;
 $$;
 
@@ -507,108 +551,164 @@ create or replace function change_image(_user_id integer, image_url text) return
 as
 $$
 begin
-    update users set media = image_url where (user_id = _user_id);
+    update users as t2 set media = image_url where t2.user_id = _user_id;
     if FOUND then
-        perform change_action(_user_id, '');
+        perform clear_action(_user_id);
         return true;
     end if;
     return false;
 end;
 $$;
 
-create or replace function create_reaction(initiator_user_id integer, rated_user_id integer,
-                                           _initiator_is_author boolean, reaction_is_ads boolean) returns integer
+create or replace function create_reaction(u_id integer, p_id integer,
+                                           reaction_is_ads boolean) returns integer
     language plpgsql
 as
 $$
 declare
-    ret    integer;
-    t_time integer;
+    ret integer;
 begin
-    if user_is_exist(initiator_user_id) then
-        t_time = extract(epoch from now());
-        insert into reactions(initiator_id, rated_id, initiator_is_author, is_ads, viewed, time)
-        values (initiator_user_id, rated_user_id, _initiator_is_author, reaction_is_ads, FALSE, t_time)
-        returning id into ret;
-    end if;
+    insert into reactions(initiator_id,
+                          rated_id,
+                          is_ads)
+    values (u_id,
+            p_id,
+            reaction_is_ads)
+    returning id into ret;
     return ret;
 end;
 $$;
 
-create or replace function get_id_next_reaction(_user_id integer) returns integer
+create or replace function like_profile(_user_id integer)
+    returns
+        table
+        (
+            is_respond   boolean,
+            _reaction_id integer,
+            user_id      integer,
+            first_name   text,
+            age          integer,
+            city         text,
+            sex          integer,
+            about        text,
+            media        text,
+            distance     real
+        )
     language plpgsql
 as
 $$
 declare
-    initiator_id int;
-    _id          integer;
+    _rated_id    integer;
+    _reaction_id integer;
+    u_latitude   real;
+    u_longitude  real;
 begin
-    if user_is_exist(_user_id) then
-        select t2.id,
-               t2.initiator_id
-        into _id,
-            initiator_id
-        from reactions as t2
-        where (
-                      t2.rated_id = _user_id and
-                      t2.liked = TRUE and
-                      t2.viewed is FALSE
-                  )
-        limit 1;
-        if FOUND then
-            perform create_reaction(_user_id, initiator_id, FALSE, FALSE);
-        end if;
+    select t1.locationLatitude, t1.locationLongitude
+    into u_latitude, u_longitude
+    from users as t1
+    where t1.user_id = _user_id;
+    update reactions as t2
+    set liked = TRUE
+    where t2.id = (select max(t2.id)
+                   from empty_reactions as t2
+                   where t2.initiator_id = _user_id
+                     and t2.message_id is not null)
+    returning id, rated_id into _reaction_id, _rated_id;
+    if FOUND then
+        return query select exists(select t2.id
+                                   from profile_reactions as t2
+                                   where t2.rated_id = _user_id
+                                     and t2.initiator_id = _rated_id and
+                                         t2.liked is TRUE) as is_respond,
+                            _reaction_id,
+                            t3.user_id,
+                            t3.first_name,
+                            t3.age,
+                            t3.city,
+                            t3.sex,
+                            t3.about,
+                            t3.media,
+                            haversine(u_latitude,
+                                      u_longitude,
+                                      t3.locationLatitude,
+                                      t3.locationLongitude)           as distance
+                     from users as t3
+                     where t3.user_id = _rated_id;
     end if;
-    return _id;
 end;
 $$;
 
-create or replace function last_created_reaction_for_like(_user_id integer) returns integer
-    language plpgsql
-as
-$$
-declare
-    last_reaction integer;
-    _rated_id     integer;
-begin
-    if user_is_exist(_user_id) then
-        select max(t2.id)
-        into last_reaction
-        from reactions as t2
-        where t2.is_ads = FALSE
-          and t2.liked is null
-          and t2.disliked is null
-          and t2.initiator_id = _user_id;
-        if found then
-            select t3.rated_id
-            into _rated_id
-            from reactions as t3
-            where t3.id = last_reaction;
-            update reactions set liked = TRUE where id = last_reaction;
-            perform t2.id
-            from reactions as t2
-            where t2.initiator_id = _rated_id
-              and t2.rated_id = _user_id
-              and t2.liked = TRUE;
-            if found then
-                return last_reaction;
-            end if;
-        end if;
-    end if;
-    return null;
-end;
-$$;
+-- create or replace function follow_profile(_user_id integer)
+--     returns
+--         table
+--         (
+--             _reaction_id integer,
+--             user_id      integer,
+--             first_name   text,
+--             age          integer,
+--             city         text,
+--             sex          integer,
+--             about        text,
+--             media        text,
+--             distance     real
+--         )
+--     language plpgsql
+-- as
+-- $$
+-- declare
+--     _initiator_id integer;
+--     _reaction_id  integer;
+--     u_latitude    real;
+--     u_longitude   real;
+-- begin
+--     if user_is_exist(_user_id) then
+--         select t1.locationLatitude, t1.locationLongitude
+--         into u_latitude, u_longitude
+--         from users as t1
+--         where t1.user_id = _user_id;
+--         select t2.initiator_id
+--         into _initiator_id
+--         from liked_reactions as t2
+--         where t2.rated_id = _user_id
+--         limit 1;
+--         if found then
+--             _reaction_id = create_reaction(_user_id, _initiator_id, FALSE);
+--             return query select _reaction_id,
+--                                 t2.user_id,
+--                                 t2.first_name,
+--                                 t2.age,
+--                                 t2.city,
+--                                 t2.sex,
+--                                 t2.about,
+--                                 t2.media,
+--                                 haversine(u_latitude,
+--                                           u_longitude,
+--                                           t2.locationLatitude,
+--                                           t2.locationLongitude) as distance
+--                          from users as t2
+--                          where t2.user_id = _initiator_id;
+--         end if;
+--     end if;
+-- end;
+-- $$;
 
 create or replace function change_action(_user_id integer, action_name text) returns boolean
     language plpgsql
 as
 $$
 begin
-    if user_is_exist(_user_id) then
-        update wait_actions set action = action_name where (user_id = _user_id);
-        return TRUE;
-    end if;
-    return FALSE;
+    update wait_actions as t2 set action = action_name where t2.user_id = _user_id;
+    return FOUND;
+end;
+$$;
+
+create or replace function clear_action(_user_id integer) returns boolean
+    language plpgsql
+as
+$$
+begin
+    update wait_actions as t2 set action = null where t2.user_id = _user_id;
+    return FOUND;
 end;
 $$;
 
@@ -616,12 +716,9 @@ create or replace function reset_ads(ads_id integer) returns boolean
     language plpgsql
 as
 $$
-declare
-    t_time integer;
 begin
-    t_time = extract(epoch from now());
-    update ads set create_time = t_time where (id = ads_id);
-    return true;
+    update ads as t2 set create_time = extract(epoch from now()) where t2.id = ads_id;
+    return FOUND;
 end;
 $$;
 
@@ -630,9 +727,9 @@ create or replace function change_age(_user_id integer, user_years integer) retu
 as
 $$
 begin
-    update users set age = user_years where (user_id = _user_id);
+    update users as t2 set age = user_years where t2.user_id = _user_id;
     if FOUND then
-        perform change_action(_user_id, '');
+        perform clear_action(_user_id);
         return true;
     end if;
     return false;
@@ -644,28 +741,34 @@ create or replace function change_user_about(_user_id integer, user_about text) 
 as
 $$
 begin
-    update users set about = user_about where (user_id = _user_id);
+    update users as t2 set about = user_about where t2.user_id = _user_id;
     if FOUND then
-        perform change_action(_user_id, '');
+        perform clear_action(_user_id);
         return true;
     end if;
     return false;
 end;
 $$;
 
-create or replace function change_location(_user_id integer, latitude real, longitude real) returns boolean
+create or replace function change_location(_user_id integer, _city text, latitude real, longitude real) returns boolean
     language plpgsql
 as
 $$
 begin
-    update users set locationLatitude = latitude, locationLongitude = longitude where (user_id = _user_id);
+    update users as t2
+    set locationLatitude  = latitude,
+        locationLongitude = longitude,
+        city              = _city
+    where t2.user_id = _user_id;
     if FOUND then
-        perform change_action(_user_id, '');
+        perform clear_action(_user_id);
         return true;
     end if;
     return false;
 end;
 $$;
+
+
 
 create or replace function get_action(_user_id integer) returns text
     language plpgsql
@@ -674,22 +777,8 @@ $$
 declare
     fun_name text;
 begin
-    if user_is_exist(_user_id) then
-        select t2.action into fun_name from wait_actions as t2 where (t2.user_id = _user_id);
-    end if;
+    select t2.action into fun_name from wait_actions as t2 where t2.user_id = _user_id;
     return fun_name;
-end;
-$$;
-
-create or replace function get_first_name(_user_id integer) returns text
-    language plpgsql
-as
-$$
-declare
-    first_name text;
-begin
-    select t2.first_name into first_name from users as t2 where (t2.user_id = _user_id);
-    return first_name;
 end;
 $$;
 
@@ -698,36 +787,25 @@ create or replace function change_search_sex(_user_id integer, user_search_sex i
 as
 $$
 begin
-    update users set search_sex = user_search_sex where (user_id = _user_id);
+    update users as t2 set search_sex = user_search_sex where t2.user_id = _user_id;
     if FOUND then
-        perform change_action(_user_id, '');
+        perform clear_action(_user_id);
         return true;
     end if;
     return false;
 end
 $$;
 
-create or replace function count_new_reactions(_user_id integer) returns integer
+create or replace function is_fulled(_user_id integer) returns boolean
     language plpgsql
 as
 $$
-declare
-    count_reactions integer;
 begin
-    if user_is_exist(_user_id) then
-        select count(t2.id)
-        into count_reactions
-        from reactions as t2
-        where (
-                      t2.rated_id = _user_id and
-                      t2.liked = TRUE and
-                      t2.viewed = FALSE
-                  );
-        if found then
-            return count_reactions;
-        end if;
-    end if;
-    return 0;
+    return exists(select t2.id
+                  from users as t2
+                  where t2.age > 0
+                    and t2.media is not null
+                    and t2.about is not null
+                    and t2.user_id = _user_id);
 end
 $$;
-
